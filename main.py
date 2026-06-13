@@ -1,71 +1,152 @@
 import cv2
-import time
 from ultralytics import YOLO
-import socket
+import serial
+import numpy as np
 
+# CONFIGURATION
+CAMERA_INDEX = 0
+CONFIDENCE_THRESHOLD = 0.60
+SERIAL_PORT = 'COM5'
+BAUD_RATE = 9600
+MIN_DETECTION_FRAMES = 8
+EMPTY_FRAMES_TO_RESET = 8
+MAX_JITTER_FRAMES = 15
+STABILITY_THRESHOLD = 200
+MIN_STABLE_FRAMES = 5
 
-CAMERA_INDEX = 0                 
-CONFIDENCE_THRESHOLD = 0.50
+print("Loading YOLO11...")
+model = YOLO('best.pt')
 
-# Current Communication method (will be replaced)
-PC2_IP = '10.60.24.219' 
-PORT = 65432
-
-client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-client_socket.connect((PC2_IP, PORT))
-
-#--------------------
-# INITIALIZATION
-#--------------------
-print("Loading YOLO11")
-model = YOLO('best.pt')  
+print("Connecting to Arduino...")
+arduino = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+time.sleep(2)
+print("Arduino connected.")
 
 print("Starting Camera Feed...")
 cap = cv2.VideoCapture(CAMERA_INDEX)
-
 if not cap.isOpened():
-    print("Error: Could not open camera. Try changing CAMERA_INDEX to 1.")
+    print("Error: Could not open camera.")
 
-#--------------------
+# STATE
+state = 'READY'
+consecutive_detections = 0
+consecutive_empty_frames = 0
+jitter_counter = 0
+
+# Stability tracking
+last_center = None
+stable_frame_count = 0
+object_is_stable = False
+
+# HELPERS
+def get_center(xyxy):
+    x1, y1, x2, y2 = map(int, xyxy)
+    return ((x1 + x2) // 2, (y1 + y2) // 2)
+
+def center_distance(c1, c2):
+    return np.sqrt((c1[0] - c2[0])**2 + (c1[1] - c2[1])**2)
+
 # VISION LOOP
-#--------------------
 while True:
     ret, frame = cap.read()
-    if not ret: break
+    if not ret:
+        break
 
-    # Square Crop Math (Prevents Distortion)
     h, w, _ = frame.shape
     size = min(h, w)
-    x1 = (w - size) // 2
-    y1 = (h - size) // 2
-    square_frame = frame[y1:y1+size, x1:x1+size]
-    final_frame = cv2.resize(square_frame, (640, 640))
+    cx = (w - size) // 2
+    cy = (h - size) // 2
+    final_frame = cv2.resize(frame[cy:cy+size, cx:cx+size], (640, 640))
 
-    # Inference
     results = model(final_frame, verbose=False)
 
+    best_detection = None
     for result in results:
-        boxes = result.boxes
-        for box in boxes:
+        for box in result.boxes:
             confidence = float(box.conf[0])
-            
             if confidence > CONFIDENCE_THRESHOLD:
-                class_id = int(box.cls[0])
-                class_name = model.names[class_id]
+                if best_detection is None or confidence > best_detection[1]:
+                    class_name = model.names[int(box.cls[0])]
+                    best_detection = (class_name, confidence, box.xyxy[0])
 
-                # Draw Visuals
-                x1_box, y1_box, x2_box, y2_box = map(int, box.xyxy[0])
-                cv2.rectangle(final_frame, (x1_box, y1_box), (x2_box, y2_box), (0, 255, 0), 2)
-                cv2.putText(final_frame, f"{class_name} {confidence:.2f}", (x1_box, y1_box - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+    # STABILITY CHECK
+    if best_detection and state == 'READY':
+        current_center = get_center(best_detection[2])
 
-                # --- ARDUINO BYPASS: PRINT TO CONSOLE INSTEAD ---
-                print(f"Target Acquired: {class_name.upper()} (Confidence: {confidence * 100:.1f}%)")
-                client_socket.sendall((f"Target Acquired: {class_name.upper()} (Confidence: {confidence * 100:.1f}%)" + '\n').encode('utf-8'))
+        if last_center is not None:
+            dist = center_distance(current_center, last_center)
+            if dist < STABILITY_THRESHOLD:
+                stable_frame_count += 1
+            else:
+                stable_frame_count = 0
+                object_is_stable = False
 
-    cv2.imshow("M&M Sorter Vision Test", final_frame)
+        if stable_frame_count >= MIN_STABLE_FRAMES:
+            object_is_stable = True
+
+        last_center = current_center
+
+    # STATE LOGIC
+    if state == 'READY':
+        if best_detection and object_is_stable:
+            # Stable detection
+            jitter_counter = 0
+            consecutive_detections += 1
+            if consecutive_detections >= MIN_DETECTION_FRAMES:
+                class_name = best_detection[0]
+                arduino.write(f"{class_name.upper()}\n".encode('utf-8'))
+                print(f"[SENT] {class_name.upper()}")
+                state = 'WAITING_EMPTY'
+                consecutive_detections = 0
+                consecutive_empty_frames = 0 
+
+        elif best_detection and not object_is_stable:
+            # Detected but not yet stable
+            jitter_counter = 0
+
+        else:
+            # Nothing detected
+            jitter_counter += 1
+            if jitter_counter > MAX_JITTER_FRAMES:
+                # Reset
+                consecutive_detections = 0
+                jitter_counter = 0
+                last_center = None
+                stable_frame_count = 0
+                object_is_stable = False
+
+    elif state == 'WAITING_EMPTY':
+        if best_detection is None:
+            consecutive_empty_frames += 1
+            if consecutive_empty_frames >= EMPTY_FRAMES_TO_RESET:
+                state = 'READY'
+                consecutive_empty_frames = 0
+                last_center = None
+                stable_frame_count = 0
+                object_is_stable = False
+                print("[STATE] Zone clear. Ready for next object.")
+        else:
+            consecutive_empty_frames = 0
+
+    # Visuals
+    if best_detection:
+        class_name, confidence, coords = best_detection
+        x1_b, y1_b, x2_b, y2_b = map(int, coords)
+        box_color = (0, 255, 0) if object_is_stable else (0, 165, 255)
+        cv2.rectangle(final_frame, (x1_b, y1_b), (x2_b, y2_b), box_color, 2)
+        cv2.putText(final_frame, f"{class_name} {confidence:.2f}",
+                    (x1_b, y1_b - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
+
+    stability_str = f"Stable: {stable_frame_count}/{MIN_STABLE_FRAMES}"
+    hud = f"State: {state} | Streak: {consecutive_detections}/{MIN_DETECTION_FRAMES} | {stability_str}"
+    cv2.putText(final_frame, hud, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+
+    cv2.imshow("M&M Sorter", final_frame)
     if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
+# CLEANUP
 cap.release()
+arduino.close()
 cv2.destroyAllWindows()
 print("System Offline.")
