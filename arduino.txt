@@ -1,0 +1,151 @@
+#include <Servo.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// CONFIGURATION
+Servo rotatorServo;  // Pin 3
+Servo hatchServo;    // Pin 5
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+int currentPos = 0;
+
+// Hatch ayarları
+int hatchCurrentPos = 0;
+int HATCH_OPEN_POS = 45;     // Hatch'in açılacağı açı
+int HATCH_CLOSE_POS = 0;     // Hatch'in geri döneceği sabit açı
+int HATCH_SPEED = 15;        // HIZ AYARI: sayı büyüdükçe daha yavaş döner
+
+// SERVO FUNCTIONS
+void moveSlowly(int targetPos) {
+  if (targetPos > currentPos) {
+    for (int pos = currentPos; pos <= targetPos; pos++) {
+      rotatorServo.write(pos);
+      delay(40);
+    }
+  } else {
+    for (int pos = currentPos; pos >= targetPos; pos--) {
+      rotatorServo.write(pos);
+      delay(40);
+    }
+  }
+  currentPos = targetPos;
+}
+
+void moveHatchSlowly(int targetPos) {
+  if (targetPos > hatchCurrentPos) {
+    for (int pos = hatchCurrentPos; pos <= targetPos; pos++) {
+      hatchServo.write(pos);
+      delay(HATCH_SPEED);
+    }
+  } else {
+    for (int pos = hatchCurrentPos; pos >= targetPos; pos--) {
+      hatchServo.write(pos);
+      delay(HATCH_SPEED);
+    }
+  }
+
+  hatchCurrentPos = targetPos;
+}
+
+void openCloseHatch() {
+  delay(2000);
+
+  moveHatchSlowly(HATCH_OPEN_POS);     
+
+  delay(1000);
+
+  moveHatchSlowly(HATCH_CLOSE_POS);    
+
+  delay(1000);
+}
+
+// LCD FUNCTION
+void displayColor(String colorName) {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Detected:");
+  lcd.setCursor(0, 1);
+  lcd.print(colorName);
+}
+
+// CORE LOGIC
+void processInput(String input) {
+  input.trim();
+  input.toLowerCase();
+
+  if (input == "center" || input == "center_slow") {
+    moveHatchSlowly(HATCH_CLOSE_POS);
+  }
+  else if (input == "mm_brown") {
+    displayColor("Brown");
+    moveSlowly(0);
+    openCloseHatch();
+  }
+  else if (input == "mm_yellow") {
+    displayColor("Yellow");
+    moveSlowly(30);
+    openCloseHatch();
+  }
+  else if (input == "mm_red") {
+    displayColor("Red");
+    moveSlowly(60);
+    openCloseHatch();
+  }
+  else if (input == "mm_orange") {
+    displayColor("Orange");
+    moveSlowly(90);
+    openCloseHatch();
+  }
+  else if (input == "mm_green") {
+    displayColor("Green");
+    moveSlowly(120);
+    openCloseHatch();
+  }
+  else if (input == "mm_blue") {
+    displayColor("Blue");
+    moveSlowly(150);
+    openCloseHatch();
+  }
+  else if (input == "anomaly") {
+    displayColor("Anomaly");
+    moveSlowly(180);
+    openCloseHatch();
+  }
+  else {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Unknown:");
+    lcd.setCursor(0, 1);
+    lcd.print(input);
+  }
+}
+
+// SETUP
+void setup() {
+  rotatorServo.attach(3);
+  hatchServo.attach(5);
+
+  rotatorServo.write(0);
+  hatchServo.write(HATCH_CLOSE_POS);
+
+  currentPos = 0;
+  hatchCurrentPos = HATCH_CLOSE_POS;
+
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("M&M Sorter");
+  lcd.setCursor(0, 1);
+  lcd.print("Ready");
+
+  Serial.begin(9600);
+  Serial.println("ARDUINO READY");
+}
+
+// LOOP
+void loop() {
+  if (Serial.available()) {
+    String input = Serial.readStringUntil('\n');
+    processInput(input);
+  }
+}
